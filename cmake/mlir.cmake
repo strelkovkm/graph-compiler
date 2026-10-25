@@ -2,7 +2,7 @@ include_guard()
 
 find_package(MLIR REQUIRED CONFIG)
 
-if(NOT GC_DYLINK)
+if(NOT GC_DYLINK OR NOT GC_ENABLE_IGC)
   set(LLVM_LINK_LLVM_DYLIB OFF)
   set(MLIR_LINK_MLIR_DYLIB OFF)
 endif()
@@ -88,11 +88,11 @@ function(gc_remove_dylib_aggregate_deps)
   endwhile()
 endfunction()
 
-if(GC_DYLINK)
+if(GC_DYLINK AND GC_ENABLE_IGC)
   set(GC_LLVM_LINK_COMPONENTS LLVM)
   set(MLIR_LINK_COMPONENTS MLIR)
   set(MLIR_EXECUTION_ENGINE MLIRExecutionEngineShared)
-else()
+elseif(GC_ENABLE_IGC)
   set(GC_LLVM_LINK_COMPONENTS Core Support nativecodegen native)
   set(MLIR_LINK_COMPONENTS MLIRAnalysis MLIRIR MLIRLLVMDialect MLIRParser
                            MLIRTargetLLVMIRExport MLIRSupport)
@@ -127,6 +127,7 @@ else()
       MLIRTensorDialect
       MLIRTensorInferTypeOpInterfaceImpl
       MLIRTensorTilingInterfaceImpl
+      MLIRTensorTransforms
       MLIRUBDialect
       MLIRVectorDialect
       MLIRVectorTransforms
@@ -153,9 +154,21 @@ else()
       MLIRVectorToLLVMPass
       MLIRVectorToXeGPU
       MLIRXeVMToLLVMIRTranslation)
+else()
+  set(GC_LLVM_LINK_COMPONENTS Core Support)
+  set(MLIR_LINK_COMPONENTS MLIRAnalysis MLIRIR MLIRParser MLIRSupport)
+  set(MLIR_DIALECT_LIBS
+      MLIRAffineDialect MLIRArithDialect MLIRArithTransforms
+      MLIRBufferizationAllExtensions MLIRBufferizationDialect
+      MLIRBufferizationTransforms MLIRFuncAllExtensions MLIRFuncDialect
+      MLIRLinalgDialect MLIRLinalgTransforms MLIRMathDialect MLIRMemRefDialect
+      MLIRMemRefTransforms MLIRSCFDialect MLIRSCFTransforms MLIRShapeDialect
+      MLIRTensorAllExtensions MLIRTensorDialect
+      MLIRTensorInferTypeOpInterfaceImpl MLIRTensorTilingInterfaceImpl
+      MLIRTensorTransforms MLIRTransforms)
 endif()
 
-if(GC_DYLINK)
+if(GC_DYLINK AND GC_ENABLE_IGC)
   target_link_libraries(GcInterface INTERFACE LLVM MLIR
                                               ${MLIR_EXECUTION_ENGINE})
 else()
@@ -169,9 +182,11 @@ else()
               ${MLIR_DIALECT_LIBS}
               ${MLIR_CONVERSION_LIBS}
               ${MLIR_EXECUTION_ENGINE}
-              ${GC_LLVM_LIBS}
-              LLVMX86CodeGen
-              LLVMX86AsmParser
-              LLVMSPIRVCodeGen
-              LLVMPerfJITEvents)
+              ${GC_LLVM_LIBS})
+  if(GC_ENABLE_IGC)
+    target_link_libraries(GcInterface INTERFACE LLVMSPIRVCodeGen)
+    if(TARGET LLVMPerfJITEvents)
+      target_link_libraries(GcInterface INTERFACE LLVMPerfJITEvents)
+    endif()
+  endif()
 endif()

@@ -14,7 +14,7 @@
 # the License. SPDX-License-Identifier: Apache-2.0
 # ##############################################################################
 
-if(NOT GC_ENABLE_GPU_RUNNER)
+if(NOT GC_ENABLE_GPU_RUNNER OR NOT GC_ENABLE_IGC)
   message(STATUS "GPU runner is disabled")
   return()
 endif()

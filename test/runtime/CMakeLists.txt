@@ -1,0 +1,5 @@
+add_executable(gc-ocl-source-test OclSource.cpp)
+target_link_libraries(gc-ocl-source-test PRIVATE GraphCompiler)
+enable_testing()
+add_test(NAME gc-ocl-source COMMAND gc-ocl-source-test)
+set_tests_properties(gc-ocl-source PROPERTIES SKIP_RETURN_CODE 77)

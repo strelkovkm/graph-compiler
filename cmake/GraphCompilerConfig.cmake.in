@@ -1,5 +1,7 @@
 @PACKAGE_INIT@
 
+set(GraphCompiler_ENABLE_IGC @GC_ENABLE_IGC@)
+
 include(CMakeFindDependencyMacro)
 
 find_dependency(MLIR REQUIRED CONFIG)

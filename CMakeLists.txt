@@ -24,6 +24,14 @@ include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 
 # ########################### Build options ####################################
+if(APPLE)
+  set(GC_ENABLE_IGC_DEFAULT OFF)
+else()
+  set(GC_ENABLE_IGC_DEFAULT ON)
+endif()
+option(GC_ENABLE_IGC "Build the Intel XeGPU/XeVM code generation backend"
+       ${GC_ENABLE_IGC_DEFAULT})
+
 option(GC_ENABLE_TEST "Build the tests" ON)
 option(GC_ENABLE_TOOLS "Build the tools" ON)
 option(GC_ENABLE_OPT "Build gc-opt" ${GC_ENABLE_TOOLS})
@@ -79,6 +87,7 @@ endif()
 # All common options, includes etc. are added to this interface target.
 add_library(GcInterface INTERFACE)
 target_compile_features(GcInterface INTERFACE cxx_std_17)
+target_compile_definitions(GcInterface INTERFACE GC_ENABLE_IGC=$<BOOL:${GC_ENABLE_IGC}>)
 target_include_directories(
   GcInterface
   INTERFACE $<BUILD_INTERFACE:${PROJECT_BINARY_DIR}/include>
@@ -110,6 +119,9 @@ add_dependencies(GcInterface GcVersion)
 add_subdirectory(include)
 add_subdirectory(lib)
 add_subdirectory(src)
+if(GC_ENABLE_TEST)
+  enable_testing()
+endif()
 add_subdirectory(test)
 # ##############################################################################
 

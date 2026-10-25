@@ -1,9 +1,27 @@
+gc_add_mlir_library(
+  GcGpuCommonPasses
+  PARTIAL_SOURCES_INTENDED
+  Registry.cpp
+  SourcePipeline.cpp
+  Decomposition.cpp
+  TensorConcatToLinalg.cpp
+  DEPENDS
+  GraphCompilerPassIncGen
+  LINK_LIBS
+  PUBLIC
+  GcInterface)
+
+if(NOT GC_ENABLE_IGC)
+  return()
+endif()
+
 add_subdirectory(OCL)
 
 get_property(GC_PASS_LIBS GLOBAL PROPERTY GC_PASS_LIBS)
 get_property(GC_DIALECT_LIBS GLOBAL PROPERTY GC_DIALECT_LIBS)
 gc_add_mlir_library(
   GcGpuPasses
+  PARTIAL_SOURCES_INTENDED
   tiling/TileContraction.cpp
   tiling/TileAttention.cpp
   tiling/TileGroupedMatmul.cpp
@@ -11,12 +29,10 @@ gc_add_mlir_library(
   AddContextArg.cpp
   ApplyPaddingLevel.cpp
   TensorMaskingOpInterface.cpp
-  Decomposition.cpp
   DropUnitDims.cpp
   GpuDeviceProps.cpp
   GpuKernelOutline.cpp
   MemrefCopyToGpuMemcpy.cpp
-  TensorConcatToLinalg.cpp
   TensorReshapeToLinalg.cpp
   Vectorize.cpp
   RemoveAllocs.cpp
@@ -37,5 +53,6 @@ gc_add_mlir_library(
   GcTensorMaskingOpInterfaceIncGen
   LINK_LIBS
   PUBLIC
+  GcGpuCommonPasses
   GcGpuOclPasses
   GcInterface)

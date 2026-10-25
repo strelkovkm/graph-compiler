@@ -30,7 +30,9 @@ int main(int argc, char *argv[]) {
   mlir::linalg::registerTransformDialectExtension(registry);
   mlir::transform::registerTransformPasses();
 
+#if GC_ENABLE_IGC
   mlir::gc::registerGPUPipeline();
+#endif
   return mlir::asMainReturnCode(mlir::MlirOptMain(
       argc, argv, "Graph Compiler modular optimizer driver\n", registry));
 }
