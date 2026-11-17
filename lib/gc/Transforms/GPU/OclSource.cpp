@@ -22,6 +22,7 @@
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <numeric>
 #include <optional>
 #include <string>
 #include <vector>
@@ -192,6 +193,8 @@ public:
       }
       if (failed(addBuffer(arg, type, {}, sizes))) return failure();
     }
+    numArgs = fn.getNumArguments();
+    SmallVector<Operation *> computeOps;
     for (Operation &op : fn.getBody().front()) {
       if (auto c = dyn_cast<arith::ConstantOp>(op)) {
         auto value = literal(c.getValue());
@@ -248,18 +251,17 @@ public:
           return failure();
       } else if (auto s = dyn_cast<memref::SubViewOp>(op)) {
         if (failed(subview(s))) return failure();
-      } else if (auto l = dyn_cast<linalg::GenericOp>(op)) {
-        if (failed(kernel(l))) return failure();
-      } else if (auto c = dyn_cast<memref::CopyOp>(op)) {
-        if (failed(copy(c))) return failure();
+      } else if (isa<linalg::GenericOp, memref::CopyOp>(op)) {
+        computeOps.push_back(&op);
       } else if (!isa<func::ReturnOp, memref::DeallocOp>(op)) {
         return op.emitError("Unsupported operation in OpenCL source backend");
       }
     }
-    return success();
+    return emitComputeOps(computeOps);
   }
 
 private:
+  size_t numArgs = 0;
   llvm::DenseMap<Value, View> views;
   llvm::DenseMap<Value, std::string> scalars;
   llvm::DenseMap<Value, SizeExpr> shapeValues;
@@ -449,7 +451,7 @@ private:
     return access(value, indices, k);
   }
   LogicalResult scalar(Operation &op,
-                       llvm::DenseMap<Value, std::string> &values, Kernel &k) {
+                       llvm::DenseMap<Value, std::string> &values, Kernel &k, bool promoteF16 = false) {
     if (op.getNumResults() != 1)
       return op.emitError("Unsupported OpenCL scalar operation");
     if (!isa<arith::ConstantOp, memref::LoadOp, arith::BitcastOp,
@@ -477,7 +479,10 @@ private:
         auto it = values.find(operand);
         if (it == values.end())
           return op.emitError("Missing OpenCL scalar operand");
-        operands.push_back(it->second);
+        std::string v = it->second;
+        if (promoteF16 && operand.getType().isF16())
+          v = "((float)(" + v + "))";
+        operands.push_back(std::move(v));
       }
       auto name = op.getName().getStringRef();
       auto binary = [&](StringRef symbol) {
@@ -593,7 +598,9 @@ private:
         }
       }
     }
-    auto type = typeName(op.getResult(0).getType());
+    auto resType = op.getResult(0).getType();
+    auto type = (promoteF16 && resType.isF16()) ? std::string("float") : typeName(resType);
+    if (promoteF16 && resType.isF16()) expression = "((float)(" + expression + "))";
     if (expression.empty() || type.empty())
       return op.emitError("Unsupported OpenCL scalar operation");
     auto name = "v" + std::to_string(nextValue++);
@@ -601,66 +608,278 @@ private:
     values[op.getResult(0)] = name;
     return success();
   }
-  LogicalResult kernel(linalg::GenericOp op) {
+  bool sameView(Value a, Value b) const {
+    auto itA = views.find(a), itB = views.find(b);
+    if (itA == views.end() || itB == views.end()) return false;
+    const View &va = itA->second, &vb = itB->second;
+    if (va.slot != vb.slot || va.offset.code != vb.offset.code ||
+        va.sizes.size() != vb.sizes.size()) return false;
+    for (size_t i = 0; i < va.sizes.size(); ++i)
+      if (va.sizes[i].code != vb.sizes[i].code ||
+          va.strides[i].code != vb.strides[i].code) return false;
+    return true;
+  }
+  bool sameLayout(Value a, Value b) const {
+    auto itA = views.find(a), itB = views.find(b);
+    if (itA == views.end() || itB == views.end()) return false;
+    const View &va = itA->second, &vb = itB->second;
+    if (va.type.getElementType() != vb.type.getElementType() ||
+        va.offset.code != vb.offset.code || va.sizes.size() != vb.sizes.size())
+      return false;
+    for (size_t i = 0; i < va.sizes.size(); ++i)
+      if (va.sizes[i].code != vb.sizes[i].code ||
+          va.strides[i].code != vb.strides[i].code) return false;
+    return true;
+  }
+  bool slotUsedFrom(size_t slot, ArrayRef<Operation *> ops, size_t from) const {
+    for (size_t i = from; i < ops.size(); ++i)
+      for (Value v : ops[i]->getOperands())
+        if (auto it = views.find(v); it != views.end() && it->second.slot == slot)
+          return true;
+    return false;
+  }
+  bool isFill(linalg::GenericOp op, std::string &fillExpr) const {
+    if (op.getNumDpsInputs() != 0 || op.getNumDpsInits() != 1) return false;
+    if (!llvm::all_of(op.getIteratorTypesArray(), [](utils::IteratorType it) {
+          return it == utils::IteratorType::parallel;
+        })) return false;
+    auto maps = op.getIndexingMapsArray();
+    if (maps.size() != 1 || !maps[0].isIdentity()) return false;
+    auto &body = op.getRegion().front();
+    if (!body.without_terminator().empty()) return false;
+    auto yield = dyn_cast<linalg::YieldOp>(body.getTerminator());
+    if (!yield || yield.getNumOperands() != 1) return false;
+    if (auto it = scalars.find(yield.getOperand(0)); it != scalars.end()) {
+      fillExpr = it->second;
+      return true;
+    }
+    return false;
+  }
+  bool canFuseFill(linalg::GenericOp fillOp, linalg::GenericOp redOp) const {
+    if (redOp.getNumDpsInits() != 1) return false;
+    bool hasRed = false;
+    for (auto it : redOp.getIteratorTypesArray()) {
+      if (it == utils::IteratorType::reduction) hasRed = true;
+      else if (hasRed) return false;
+    }
+    if (!hasRed) return false;
+    Value fOut = fillOp.getDpsInitOperand(0)->get();
+    if (!sameView(fOut, redOp.getDpsInitOperand(0)->get())) return false;
+    size_t fSlot = views.find(fOut)->second.slot;
+    for (OpOperand *in : redOp.getDpsInputOperands())
+      if (auto it = views.find(in->get()); it != views.end() && it->second.slot == fSlot)
+        return false;
+    return true;
+  }
+  bool canFuseEpi(linalg::GenericOp redOp, linalg::GenericOp epiOp,
+                  ArrayRef<Operation *> ops, size_t nextIdx) const {
+    if (redOp.getNumDpsInits() != 1 || epiOp.getNumDpsInits() != 1) return false;
+    size_t numPar = 0;
+    bool seenRed = false;
+    for (auto it : redOp.getIteratorTypesArray()) {
+      if (it == utils::IteratorType::parallel) {
+        if (seenRed) return false;
+        ++numPar;
+      } else seenRed = true;
+    }
+    if (!seenRed || !numPar) return false;
+    auto epiIters = epiOp.getIteratorTypesArray();
+    if (epiIters.size() != numPar ||
+        !llvm::all_of(epiIters, [](utils::IteratorType it) {
+          return it == utils::IteratorType::parallel;
+        })) return false;
+    AffineMap rOutMap = redOp.getIndexingMapsArray().back();
+    if (rOutMap.getNumResults() != numPar) return false;
+    for (unsigned i = 0; i < numPar; ++i)
+      if (rOutMap.getResult(i) != getAffineDimExpr(i, redOp.getContext()))
+        return false;
+    auto epiMaps = epiOp.getIndexingMapsArray();
+    if (!epiMaps.back().isIdentity()) return false;
+    Value rOut = redOp.getDpsInitOperand(0)->get();
+    size_t rSlot = views.find(rOut)->second.slot;
+    bool matched = false;
+    for (size_t i = 0; i < static_cast<size_t>(epiOp.getNumDpsInputs()); ++i) {
+      Value in = epiOp.getDpsInputOperand(i)->get();
+      if (auto it = views.find(in); it != views.end() && it->second.slot == rSlot) {
+        if (!sameView(in, rOut) || !epiMaps[i].isIdentity()) return false;
+        matched = true;
+      }
+    }
+    if (!matched) return false;
+    size_t eSlot = views.find(epiOp.getDpsInitOperand(0)->get())->second.slot;
+    if (eSlot != rSlot && (rSlot < numArgs || slotUsedFrom(rSlot, ops, nextIdx)))
+      return false;
+    return true;
+  }
+  bool canRedirectCopy(linalg::GenericOp firstOp, linalg::GenericOp prodOp,
+                       memref::CopyOp copyOp, ArrayRef<Operation *> ops,
+                       size_t nextIdx) const {
+    if (prodOp.getNumDpsInits() != 1) return false;
+    Value pOut = prodOp.getDpsInitOperand(0)->get();
+    if (!sameView(pOut, copyOp.getSource()) ||
+        !sameLayout(copyOp.getSource(), copyOp.getTarget())) return false;
+    size_t tSlot = views.find(pOut)->second.slot;
+    size_t dSlot = views.find(copyOp.getTarget())->second.slot;
+    if (tSlot < numArgs || slotUsedFrom(tSlot, ops, nextIdx)) return false;
+    for (OpOperand *in : firstOp.getDpsInputOperands())
+      if (auto it = views.find(in->get()); it != views.end() && it->second.slot == dSlot)
+        return false;
+    for (OpOperand *in : prodOp.getDpsInputOperands())
+      if (auto it = views.find(in->get()); it != views.end() && it->second.slot == dSlot)
+        return false;
+    return true;
+  }
+  LogicalResult emitComputeOps(ArrayRef<Operation *> computeOps) {
+    for (size_t idx = 0; idx < computeOps.size(); ++idx) {
+      if (auto l = dyn_cast<linalg::GenericOp>(*computeOps[idx])) {
+        std::optional<std::string> fillInit;
+        linalg::GenericOp epi;
+        Value outOverride;
+        if (idx + 1 < computeOps.size())
+          if (auto nextL = dyn_cast<linalg::GenericOp>(*computeOps[idx + 1])) {
+            std::string fVal;
+            if (isFill(l, fVal) && canFuseFill(l, nextL)) {
+              fillInit = fVal;
+              l = nextL;
+              ++idx;
+            }
+          }
+        if (idx + 1 < computeOps.size())
+          if (auto nextL = dyn_cast<linalg::GenericOp>(*computeOps[idx + 1]))
+            if (canFuseEpi(l, nextL, computeOps, idx + 2)) {
+              epi = nextL;
+              ++idx;
+            }
+        linalg::GenericOp prod = epi ? epi : l;
+        if (idx + 1 < computeOps.size())
+          if (auto cOp = dyn_cast<memref::CopyOp>(*computeOps[idx + 1]))
+            if (canRedirectCopy(l, prod, cOp, computeOps, idx + 2)) {
+              outOverride = cOp.getTarget();
+              ++idx;
+            }
+        if (failed(kernel(l, fillInit, epi, outOverride))) return failure();
+      } else if (auto c = dyn_cast<memref::CopyOp>(*computeOps[idx])) {
+        if (failed(copy(c))) return failure();
+      }
+    }
+    return success();
+  }
+  LogicalResult kernel(linalg::GenericOp op,
+                       std::optional<std::string> fillInit = std::nullopt,
+                       linalg::GenericOp epi = nullptr,
+                       Value outOverride = nullptr) {
     auto linalgOp = cast<linalg::LinalgOp>(op.getOperation());
     SmallVector<SizeExpr> dims;
-    for (Value operand : op.getOperands()) {
-      auto type = dyn_cast<MemRefType>(operand.getType());
-      if (type) {
+    for (Value operand : op.getOperands())
+      if (isa<MemRefType>(operand.getType())) {
         auto it = views.find(operand);
         if (it == views.end()) return op.emitError("Missing OpenCL buffer");
         llvm::append_range(dims, it->second.sizes);
       }
-    }
     auto shapeMap = linalgOp.getShapesToLoopsMap();
     if (!shapeMap) return op.emitError("Cannot infer OpenCL loop bounds");
     SmallVector<SizeExpr> bounds;
     for (auto expr : shapeMap.getResults())
       bounds.push_back(dims[cast<AffineDimExpr>(expr).getPosition()]);
     auto iterators = linalgOp.getIteratorTypesArray();
+    bool hasRed = llvm::any_of(iterators, [](utils::IteratorType it) {
+      return it == utils::IteratorType::reduction;
+    });
     Kernel k{"gc_source_" + std::to_string(kernels.size()), {}, 1, {}};
     k.body = "size_t tid=get_global_id(0);\n";
-    for (size_t i = bounds.size(); i-- > 0;) {
+    for (size_t i = bounds.size(); i-- > 0;)
       if (iterators[i] == utils::IteratorType::parallel) {
         k.workItems = sizeBinary(k.workItems, bounds[i], '*');
-        auto divisor = bounds[i].constant;
-        auto extent = divisor ? std::to_string(std::max<int64_t>(*divisor, 1))
-                              : "max((long)(" + bounds[i].code + "),1L)";
-        k.body += "long i" + std::to_string(i) + "=tid%" + extent +
-                  ";tid/=" + extent + ";\n";
+        auto div = bounds[i].constant;
+        auto ext = div ? std::to_string(std::max<int64_t>(*div, 1))
+                       : "max((long)(" + bounds[i].code + "),1L)";
+        k.body += "long i" + std::to_string(i) + "=tid%" + ext + ";tid/=" + ext + ";\n";
+      }
+    llvm::DenseMap<Value, std::string> values = scalars;
+    auto maps = op.getIndexingMapsArray();
+    auto &body = op.getRegion().front();
+    if (hasRed) {
+      for (size_t i = 0; i < static_cast<size_t>(op.getNumDpsInits()); ++i) {
+        auto oIdx = op.getNumDpsInputs() + i;
+        bool f16Acc = body.getArgument(oIdx).getType().isF16();
+        auto accT = f16Acc ? std::string("float") : typeName(body.getArgument(oIdx).getType());
+        std::string init = (i == 0 && fillInit)
+                               ? *fillInit
+                               : mappedAccess(op.getOperand(oIdx), maps[oIdx], k);
+        if (accT.empty() || init.empty()) return op.emitError("Bad OpenCL acc");
+        k.body += accT + " acc" + std::to_string(i) + "=(" + accT + ")(" + init + ");\n";
+        values[body.getArgument(oIdx)] = "acc" + std::to_string(i);
       }
     }
-    for (size_t i = 0; i < bounds.size(); ++i) {
+    for (size_t i = 0; i < bounds.size(); ++i)
       if (iterators[i] == utils::IteratorType::reduction)
         k.body += "for(long i" + std::to_string(i) + "=0;i" +
                   std::to_string(i) + "<" + bounds[i].code + ";++i" +
                   std::to_string(i) + "){\n";
-    }
-    llvm::DenseMap<Value, std::string> values = scalars;
-    auto maps = op.getIndexingMapsArray();
-    auto &body = op.getRegion().front();
+    bool f16Red = hasRed && body.getArgument(op.getNumDpsInputs()).getType().isF16();
     for (size_t i = 0; i < op.getNumOperands(); ++i) {
+      if (hasRed && i >= static_cast<size_t>(op.getNumDpsInputs())) continue;
+      if (!hasRed && i >= static_cast<size_t>(op.getNumDpsInputs()) && outOverride &&
+          body.getArgument(i).use_empty()) continue;
       Value operand = op.getOperand(i);
       std::string expr = isa<MemRefType>(operand.getType())
                              ? mappedAccess(operand, maps[i], k)
                              : values.lookup(operand);
       if (expr.empty()) return op.emitError("Unsupported OpenCL indexing");
+      if (f16Red && body.getArgument(i).getType().isF16())
+        expr = "((float)(" + expr + "))";
       values[body.getArgument(i)] = expr;
     }
     for (Operation &nested : body.without_terminator())
-      if (failed(scalar(nested, values, k))) return failure();
+      if (failed(scalar(nested, values, k, f16Red))) return failure();
     auto yield = cast<linalg::YieldOp>(body.getTerminator());
-    for (size_t i = 0; i < yield.getNumOperands(); ++i) {
-      auto operandIndex = op.getNumDpsInputs() + i;
-      auto dest =
-          mappedAccess(op.getOperand(operandIndex), maps[operandIndex], k);
-      auto result = values.lookup(yield.getOperand(i));
-      if (dest.empty() || result.empty())
-        return op.emitError("Missing OpenCL output");
-      k.body += dest + "=" + result + ";\n";
+    if (hasRed) {
+      for (size_t i = 0; i < yield.getNumOperands(); ++i)
+        k.body += "acc" + std::to_string(i) + "=" +
+                  values.lookup(yield.getOperand(i)) + ";\n";
+      for (auto it : iterators)
+        if (it == utils::IteratorType::reduction) k.body += "}\n";
+      if (epi) {
+        llvm::DenseMap<Value, std::string> eVals = scalars;
+        auto eMaps = epi.getIndexingMapsArray();
+        auto &eBody = epi.getRegion().front();
+        size_t rSlot = views.find(op.getDpsInitOperand(0)->get())->second.slot;
+        for (size_t j = 0; j < epi.getNumOperands(); ++j) {
+          Value eOp = epi.getOperand(j);
+          if (j < static_cast<size_t>(epi.getNumDpsInputs())) {
+            if (auto it = views.find(eOp); it != views.end() && it->second.slot == rSlot) {
+              eVals[eBody.getArgument(j)] = f16Red ? "((gc_half)acc0)" : "acc0";
+              continue;
+            }
+          } else if (eBody.getArgument(j).use_empty()) continue;
+          std::string expr = isa<MemRefType>(eOp.getType())
+                                 ? mappedAccess(eOp, eMaps[j], k)
+                                 : eVals.lookup(eOp);
+          if (expr.empty()) return epi.emitError("Bad epilogue indexing");
+          eVals[eBody.getArgument(j)] = expr;
+        }
+        for (Operation &nested : eBody.without_terminator())
+          if (failed(scalar(nested, eVals, k))) return failure();
+        auto eYield = cast<linalg::YieldOp>(eBody.getTerminator());
+        Value fOut = outOverride ? outOverride : epi.getDpsInitOperand(0)->get();
+        k.body += mappedAccess(fOut, eMaps.back(), k) + "=" +
+                  eVals.lookup(eYield.getOperand(0)) + ";\n";
+      } else {
+        for (size_t i = 0; i < yield.getNumOperands(); ++i) {
+          auto oIdx = op.getNumDpsInputs() + i;
+          Value fOut = (i == 0 && outOverride) ? outOverride : op.getOperand(oIdx);
+          k.body += mappedAccess(fOut, maps[oIdx], k) + "=" + (f16Red ? "((gc_half)acc" : "acc") +
+                    std::to_string(i) + (f16Red ? ");\n" : ";\n");
+        }
+      }
+    } else {
+      for (size_t i = 0; i < yield.getNumOperands(); ++i) {
+        auto oIdx = op.getNumDpsInputs() + i;
+        Value fOut = (i == 0 && outOverride) ? outOverride : op.getOperand(oIdx);
+        k.body += mappedAccess(fOut, maps[oIdx], k) + "=" +
+                  values.lookup(yield.getOperand(i)) + ";\n";
+      }
     }
-    for (auto iterator : iterators)
-      if (iterator == utils::IteratorType::reduction) k.body += "}\n";
     kernels.push_back(std::move(k));
     return success();
   }
@@ -723,6 +942,9 @@ struct ConvertOclSource
     };
     for (Value arg : fn.getArguments()) buffers.push_back(pointer(arg));
     for (size_t i = buffers.size(); i < source.buffers.size(); ++i) {
+      if (!llvm::any_of(source.kernels, [&](const Kernel &k) { return llvm::is_contained(k.slots, i); })) {
+        buffers.push_back(Value()); continue;
+      }
       auto &buffer = source.buffers[i];
       Value size = buffer.bytes.materialize(b, loc, dimensions);
       auto type = MemRefType::get({ShapedType::kDynamic}, b.getI8Type());
@@ -803,10 +1025,19 @@ struct ConvertOclSource
       }
       KernelAttrs(module, moduleName).setDepends(previous);
       previous.push_back(moduleName);
-      Value work = kernel.workItems.materialize(b, loc, dimensions);
       Value one = arith::ConstantIndexOp::create(b, loc, 1);
-      gpu::LaunchFuncOp::create(b, loc, entry, gpu::KernelDim3{work, one, one},
-                                gpu::KernelDim3{one, one, one}, Value(), args);
+      Value gridX, blockX;
+      if (kernel.workItems.constant && *kernel.workItems.constant > 0) {
+        int64_t total = *kernel.workItems.constant;
+        int64_t local = std::gcd(total, int64_t(256));
+        gridX = arith::ConstantIndexOp::create(b, loc, total / local);
+        blockX = arith::ConstantIndexOp::create(b, loc, local);
+      } else {
+        gridX = kernel.workItems.materialize(b, loc, dimensions);
+        blockX = one;
+      }
+      gpu::LaunchFuncOp::create(b, loc, entry, gpu::KernelDim3{gridX, one, one},
+                                gpu::KernelDim3{blockX, one, one}, Value(), args);
     }
     for (Value alloc : allocations)
       gpu::DeallocOp::create(b, loc, Type(), ValueRange{}, alloc);
