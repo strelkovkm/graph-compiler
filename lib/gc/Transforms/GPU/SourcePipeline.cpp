@@ -238,7 +238,7 @@ struct SourceGroupedMatmul : OpRewritePattern<linalgx::GroupedMatmulOp> {
     auto weights = dyn_cast<RankedTensorType>(op.getWeights().getType());
     auto out = dyn_cast<RankedTensorType>(op.getOutput().getType());
     if (!lhs || !weights || !out || weights.isDynamicDim(0) ||
-        !lhs.getElementType().isF32() ||
+        (!lhs.getElementType().isF32() && !lhs.getElementType().isF16()) ||
         weights.getElementType() != lhs.getElementType() ||
         out.getElementType() != lhs.getElementType())
       return failure();
